@@ -29,6 +29,7 @@ MIN_TRACK_HISTORY = int(os.getenv("MIN_TRACK_HISTORY", "2"))
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8s.pt")
 INFER_IMG_SIZE = int(os.getenv("INFER_IMG_SIZE", "416"))
 PROCESS_EVERY_N_FRAMES = max(1, int(os.getenv("PROCESS_EVERY_N_FRAMES", "1")))
+INFERENCE_MAX_FPS = max(0.1, float(os.getenv("INFERENCE_MAX_FPS", "8")))
 FALLBACK_DETECT_INTERVAL = max(1, int(os.getenv("FALLBACK_DETECT_INTERVAL", "6")))
 CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
 CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
@@ -157,7 +158,8 @@ def run_camera():
     model = YOLO(MODEL_PATH)
     print(
         f"[Camera] Using model={MODEL_PATH}, imgsz={INFER_IMG_SIZE}, "
-        f"process_every_n_frames={PROCESS_EVERY_N_FRAMES}, tracker={TRACKER_CONFIG}"
+        f"process_every_n_frames={PROCESS_EVERY_N_FRAMES}, "
+        f"inference_max_fps={INFERENCE_MAX_FPS}, tracker={TRACKER_CONFIG}"
     )
 
     def open_camera():
@@ -224,13 +226,98 @@ def run_camera():
     capture_thread = threading.Thread(target=capture_frames, daemon=True)
     capture_thread.start()
 
-    processed_frame_index = 0
-    latest_count = 0
-    latest_detections = []
-    latest_boxes_for_draw = []
-    latest_processed_time = ""
+    latest_result = {"count": 0, "detections": [], "boxes": [], "time": ""}
+    latest_result_lock = threading.Lock()
+    latest_sync_state = {"count": 0, "detections": []}
+    latest_sync_lock = threading.Lock()
+    inference_interval = 1.0 / INFERENCE_MAX_FPS
 
-    try:
+    def process_frame(frame, frame_index):
+        global prev_frame
+
+        _, w, _ = frame.shape
+        current_time = datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S")
+        results = model.track(
+            frame,
+            persist=True,
+            conf=0.4,
+            iou=0.5,
+            imgsz=INFER_IMG_SIZE,
+            tracker=TRACKER_CONFIG,
+            verbose=False,
+        )
+        current_boxes = []
+
+        for result in results:
+            for box in result.boxes:
+                cls = int(box.cls[0])
+                if cls != 0 or box.conf[0] <= 0.4:
+                    continue
+
+                track_id = int(box.id[0]) if box.id is not None else -1
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                if x1 > w * 0.85:
+                    continue
+
+                if box.id is not None and not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
+                    continue
+
+                if box.id is not None:
+                    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+                    track_history.setdefault(track_id, []).append(center)
+                    if len(track_history[track_id]) > 10:
+                        track_history[track_id].pop(0)
+                    if len(track_history[track_id]) < MIN_TRACK_HISTORY:
+                        continue
+
+                current_boxes.append((track_id, x1, y1, x2, y2))
+
+        if not current_boxes and frame_index % FALLBACK_DETECT_INTERVAL == 0:
+            detect_results = model(frame, conf=0.4, imgsz=INFER_IMG_SIZE, verbose=False)
+            fallback_id = 1
+            for result in detect_results:
+                for box in result.boxes:
+                    cls = int(box.cls[0])
+                    if cls != 0 or box.conf[0] <= 0.4:
+                        continue
+
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    if x1 > w * 0.85:
+                        continue
+
+                    current_boxes.append((fallback_id, x1, y1, x2, y2))
+                    fallback_id += 1
+
+        removed_ids = set()
+        for i in range(len(current_boxes)):
+            for j in range(i + 1, len(current_boxes)):
+                _, x1a, y1a, x2a, y2a = current_boxes[i]
+                id2, x1b, y1b, x2b, y2b = current_boxes[j]
+                if is_mirror_pair((x1a, y1a, x2a, y2a), (x1b, y1b, x2b, y2b), w):
+                    removed_ids.add(id2)
+
+        current_count = 0
+        current_detections = []
+        boxes_for_draw = []
+
+        for track_id, x1, y1, x2, y2 in current_boxes:
+            if track_id in removed_ids:
+                continue
+
+            current_count += 1
+            current_detections.append({"id": track_id, "bbox": [x1, y1, x2, y2]})
+            boxes_for_draw.append((track_id, x1, y1, x2, y2))
+
+        prev_frame = frame.copy()
+        return current_count, current_detections, boxes_for_draw, current_time
+
+    def run_inference():
+        global people_count, last_updated, detections
+
+        processed_frame_index = 0
+        last_inference_at = 0.0
+
         while capture_running:
             with latest_frame_lock:
                 frame = None if latest_frame is None else latest_frame.copy()
@@ -240,87 +327,65 @@ def run_camera():
                 time.sleep(IDLE_SLEEP_SECONDS)
                 continue
 
+            if frame_index % PROCESS_EVERY_N_FRAMES != 0:
+                time.sleep(IDLE_SLEEP_SECONDS)
+                continue
+
+            wait_seconds = inference_interval - (time.time() - last_inference_at)
+            if wait_seconds > 0:
+                time.sleep(min(wait_seconds, 0.02))
+                continue
+
             processed_frame_index = frame_index
+            last_inference_at = time.time()
+            current_count, current_detections, boxes_for_draw, processed_time = process_frame(frame, frame_index)
 
-            _, w, _ = frame.shape
-            current_time = datetime.now(get_app_timezone()).strftime("%Y-%m-%d %H:%M:%S")
-            should_process = frame_index % PROCESS_EVERY_N_FRAMES == 0
+            with latest_result_lock:
+                latest_result["count"] = current_count
+                latest_result["detections"] = current_detections
+                latest_result["boxes"] = boxes_for_draw
+                latest_result["time"] = processed_time
 
-            if should_process:
-                results = model.track(
-                    frame,
-                    persist=True,
-                    conf=0.4,
-                    iou=0.5,
-                    imgsz=INFER_IMG_SIZE,
-                    tracker=TRACKER_CONFIG,
-                    verbose=False,
-                )
-                current_boxes = []
+            with state_lock:
+                people_count = current_count
+                detections = current_detections
+                last_updated = processed_time
 
-                for result in results:
-                    for box in result.boxes:
-                        cls = int(box.cls[0])
-                        if cls != 0 or box.conf[0] <= 0.4:
-                            continue
+            with latest_sync_lock:
+                latest_sync_state["count"] = current_count
+                latest_sync_state["detections"] = current_detections
 
-                        track_id = int(box.id[0]) if box.id is not None else -1
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+    def sync_to_render_loop():
+        while capture_running:
+            with latest_sync_lock:
+                current_count = latest_sync_state["count"]
+                current_detections = list(latest_sync_state["detections"])
 
-                        if x1 > w * 0.85:
-                            continue
+            sync_state_to_render(current_count, current_detections, camera_enabled=True)
+            time.sleep(IDLE_SLEEP_SECONDS)
 
-                        if box.id is not None and not has_motion(cv2, np, prev_frame, frame, (x1, y1, x2, y2)):
-                            continue
+    inference_thread = threading.Thread(target=run_inference, daemon=True)
+    sync_thread = threading.Thread(target=sync_to_render_loop, daemon=True)
+    inference_thread.start()
+    sync_thread.start()
 
-                        if box.id is not None:
-                            center = ((x1 + x2) // 2, (y1 + y2) // 2)
-                            track_history.setdefault(track_id, []).append(center)
-                            if len(track_history[track_id]) > 10:
-                                track_history[track_id].pop(0)
-                            if len(track_history[track_id]) < MIN_TRACK_HISTORY:
-                                continue
+    displayed_frame_index = 0
 
-                        current_boxes.append((track_id, x1, y1, x2, y2))
+    try:
+        while capture_running:
+            with latest_frame_lock:
+                frame = None if latest_frame is None else latest_frame.copy()
+                frame_index = latest_frame_index
 
-                if not current_boxes and frame_index % FALLBACK_DETECT_INTERVAL == 0:
-                    detect_results = model(frame, conf=0.4, imgsz=INFER_IMG_SIZE, verbose=False)
-                    fallback_id = 1
-                    for result in detect_results:
-                        for box in result.boxes:
-                            cls = int(box.cls[0])
-                            if cls != 0 or box.conf[0] <= 0.4:
-                                continue
+            if frame is None or frame_index == displayed_frame_index:
+                time.sleep(IDLE_SLEEP_SECONDS)
+                continue
 
-                            x1, y1, x2, y2 = map(int, box.xyxy[0])
-                            if x1 > w * 0.85:
-                                continue
+            displayed_frame_index = frame_index
 
-                            current_boxes.append((fallback_id, x1, y1, x2, y2))
-                            fallback_id += 1
-
-                removed_ids = set()
-                for i in range(len(current_boxes)):
-                    for j in range(i + 1, len(current_boxes)):
-                        _, x1a, y1a, x2a, y2a = current_boxes[i]
-                        id2, x1b, y1b, x2b, y2b = current_boxes[j]
-                        if is_mirror_pair((x1a, y1a, x2a, y2a), (x1b, y1b, x2b, y2b), w):
-                            removed_ids.add(id2)
-
-                latest_count = 0
-                latest_detections = []
-                latest_boxes_for_draw = []
-                latest_processed_time = current_time
-
-                for track_id, x1, y1, x2, y2 in current_boxes:
-                    if track_id in removed_ids:
-                        continue
-
-                    latest_count += 1
-                    latest_detections.append({"id": track_id, "bbox": [x1, y1, x2, y2]})
-                    latest_boxes_for_draw.append((track_id, x1, y1, x2, y2))
-
-                prev_frame = frame.copy()
+            with latest_result_lock:
+                latest_count = latest_result["count"]
+                latest_boxes_for_draw = list(latest_result["boxes"])
 
             for track_id, x1, y1, x2, y2 in latest_boxes_for_draw:
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
@@ -333,13 +398,6 @@ def run_camera():
                     (255, 0, 0),
                     2,
                 )
-
-            with state_lock:
-                people_count = latest_count
-                detections = latest_detections
-                last_updated = latest_processed_time or current_time
-
-            sync_state_to_render(latest_count, latest_detections, camera_enabled=True)
 
             cv2.putText(
                 frame,
@@ -357,6 +415,8 @@ def run_camera():
     finally:
         capture_running = False
         capture_thread.join(timeout=1)
+        inference_thread.join(timeout=2)
+        sync_thread.join(timeout=1)
         cap.release()
         cv2.destroyAllWindows()
         sync_state_to_render(0, [], camera_enabled=False, force=True)
